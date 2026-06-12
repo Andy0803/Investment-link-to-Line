@@ -22,13 +22,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests pandas scipy matplotlib lxml html5lib
+        run: pip install "requests>=2.31,<3" "pandas>=2.1,<3" "scipy>=1.11,<2" "matplotlib>=3.8,<4" "lxml>=5,<7" html5lib
 
       # 第一階段：產生 PNG + summary.json
       - name: Generate GEX chart
         env:
           LINE_CHANNEL_ID:     ${{ secrets.LINE_CHANNEL_ID }}
           LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+          LINE_USER_ID:        ${{ secrets.LINE_USER_ID }}   # 失敗通知用
         run: python txo_gex.py
 
       # 第二階段：把 PNG commit 回 repo（讓 GitHub raw URL 有最新圖）
@@ -51,4 +52,3 @@ jobs:
           LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
           LINE_USER_ID:        ${{ secrets.LINE_USER_ID }}
         run: python txo_gex.py --push
-
