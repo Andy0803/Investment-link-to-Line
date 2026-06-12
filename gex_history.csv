@@ -1,2 +1,2 @@
-date,spot,call_wall,put_wall,macro_zero,micro_flip,speed_peak,speed_valley,regime
-2026-06-12,43219,45000,40000,43022,43006,43673,45618,POS_GAMMA
+date,spot,call_wall,put_wall,macro_zero,micro_flip,speed_peak,speed_valley,regime,critical,next_open,next_high,next_low,next_close,next_ret_pct
+2026-06-12,43219,45000,40000,43022,43006,43673,45618,POS_GAMMA,True,,,,,
