@@ -3,11 +3,14 @@
 """
 TXO Dealer Gamma Exposure (GEX) 模型  ─ LINE 推播版 v3
 =======================================================
-v3 新增:
-  [1] generate_signal()  → 量化訊號層:今日 gamma 區域判讀 + 上下關卡,直接寫進 LINE 摘要
-  [2] gex_history.csv    → 每日關鍵價位自動記錄,累積回測資料
-  [3] OI 變化量修正      → 用 ΔOI 調整各合約權重,精修 dealer 部位假設
-                           (oi_snapshot.csv 存每日 OI,隔日計算變化量)
+v4 新增 (邁向可驗證的量化系統):
+  [4] 隔日報酬自動回填    → 每天抓 TX OHLC,回填昨日記錄的 next_open/high/low/close/ret
+  [5] --backtest          → 回測引擎:按 regime 分組統計勝率/期望報酬/波動,含成本估算
+  [6] 波動率自適應門檻    → 臨界判定改用近月 ATM IV 換算的日波動,取代固定 0.5%
+
+v3 功能:
+  [1] generate_signal()  → 量化訊號層  [2] gex_history.csv → 每日記錄
+  [3] ΔOI 權重修正 (oi_snapshot.csv)
 
 GitHub Actions 流程:
   1. python txo_gex.py        → 產生 txo_gex.png + summary.json + 更新 csv
@@ -41,6 +44,7 @@ GITHUB_RAW = (
     "https://raw.githubusercontent.com/"
     "Andy0803/Investment-link-to-Line/main/txo_gex.png"
 )
+COST_PTS      = 12.0   # 單邊交易成本估計(大台,點):手續費+期交稅+滑價,回測用
 SNAPSHOT_FILE = "oi_snapshot.csv"
 HISTORY_FILE  = "gex_history.csv"
 
@@ -123,20 +127,28 @@ def fetch_txo_openapi():
         "oi":          pd.to_numeric(df[c_oi], errors="coerce"),
     }).dropna(subset=["strike", "cp", "oi"])
 
-def fetch_spot_openapi():
+def fetch_tx_daily():
+    """TX 近月完整日資料 (open/high/low/close/settle) → spot + 隔日回填用"""
     df = fetch_openapi("DailyMarketReportFut")
     c_contract = pick_col(df.columns, "契約", "contract")
     c_month    = pick_col(df.columns, "到期", "month")
     c_settle   = pick_col(df.columns, "結算", "settle")
     c_last     = pick_col(df.columns, "收盤", "last", "close")
+    c_open     = pick_col(df.columns, "開盤", "open")
+    c_high     = pick_col(df.columns, "最高", "high")
+    c_low      = pick_col(df.columns, "最低", "low")
     df = df[df[c_contract].astype(str).str.strip() == "TX"].copy()
     df["m"] = df[c_month].astype(str).str.strip()
     df = df[df["m"].str.fullmatch(r"\d{6}")].sort_values("m")
     row = df.iloc[0]
-    px  = pd.to_numeric(row[c_settle], errors="coerce")
-    if not np.isfinite(px) or px <= 0:
-        px = pd.to_numeric(row[c_last], errors="coerce")
-    return float(px)
+    def num(c):
+        v = pd.to_numeric(row[c], errors="coerce") if c else np.nan
+        return float(v) if np.isfinite(v) and v > 0 else np.nan
+    settle = num(c_settle)
+    close  = num(c_last)
+    return {"open": num(c_open), "high": num(c_high), "low": num(c_low),
+            "close": close if np.isfinite(close) else settle,
+            "settle": settle if np.isfinite(settle) else close}
 
 def fetch_txo_web(qdate):
     url  = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
@@ -290,12 +302,21 @@ def build_model(df, spot, today=None):
                 spot=float(spot))
 
 # ══════════════════════════════════════════ [1] 量化訊號層
-def generate_signal(m):
-    """把 GEX 結構轉成今日判讀 + 上下關卡,回傳 (regime_code, text)"""
+def generate_signal(m, atm_iv=None):
+    """把 GEX 結構轉成今日判讀 + 上下關卡,回傳 (regime_code, critical, text)
+    [6] 臨界門檻波動率自適應: threshold = spot × ATM_IV × sqrt(1/252) × 0.5
+        (= 半個「一日標準差」),無 IV 時 fallback 固定 0.5%"""
     spot, mz = m["spot"], m["macro_zero"]
 
     if mz is None:
-        return "UNKNOWN", "🧭 今日判讀\n翻轉點計算失敗,僅供參考"
+        return "UNKNOWN", False, "🧭 今日判讀\n翻轉點計算失敗,僅供參考"
+
+    if atm_iv and np.isfinite(atm_iv):
+        threshold = spot * atm_iv * np.sqrt(1 / 252) * 0.5
+        thr_note  = f"(門檻 {threshold:.0f} 點 = 0.5×日波動, IV {atm_iv:.0%})"
+    else:
+        threshold = spot * 0.005
+        thr_note  = f"(門檻 {threshold:.0f} 點 = 固定0.5%)"
 
     dist = spot - mz
     if dist > 0:
@@ -307,10 +328,12 @@ def generate_signal(m):
         regime_txt  = "負Gamma區 → 趨勢/波動放大"
         bias        = "順勢策略有利,買方(long gamma)順風;勿逆勢凹單"
 
-    # 距離警示:離翻轉點 0.5% 以內視為臨界狀態
-    if abs(dist) < spot * 0.005:
+    # 距離警示:波動率自適應臨界判定
+    critical = abs(dist) < threshold
+    if critical:
         regime_txt += " ⚠️臨界"
-        bias = f"距翻轉點僅 {abs(dist):.0f} 點,結構隨時切換,留意 {mz:.0f} 攻防"
+        bias = (f"距翻轉點僅 {abs(dist):.0f} 點 {thr_note},"
+                f"結構隨時切換,留意 {mz:.0f} 攻防")
 
     # 上下最近關卡
     levels = {"Call Wall": m["call_wall"], "Put Wall": m["put_wall"],
@@ -330,10 +353,12 @@ def generate_signal(m):
     if sup:
         lines.append(f"下方關卡 {sup[1]:.0f} ({sup[0]})")
     lines.append(f"💡 {bias}")
-    return regime_code, "\n".join(lines)
+    return regime_code, critical, "\n".join(lines)
 
 # ══════════════════════════════════════════ [2] 回測資料記錄
-def append_history(m, regime_code):
+NEXT_COLS = ["next_open", "next_high", "next_low", "next_close", "next_ret_pct"]
+
+def append_history(m, regime_code, critical):
     row = {
         "date":       str(date.today()),
         "spot":       round(m["spot"]),
@@ -344,7 +369,10 @@ def append_history(m, regime_code):
         "speed_peak": round(m["peak"]),
         "speed_valley": round(m["valley"]),
         "regime":     regime_code,
+        "critical":   bool(critical),
     }
+    for c in NEXT_COLS:
+        row[c] = None
     if os.path.exists(HISTORY_FILE):
         hist = pd.read_csv(HISTORY_FILE)
         hist = hist[hist["date"] != row["date"]]          # 同日重跑 → 覆蓋
@@ -353,6 +381,71 @@ def append_history(m, regime_code):
         hist = pd.DataFrame([row])
     hist.to_csv(HISTORY_FILE, index=False)
     print(f"[history] 已記錄 {row['date']} → {HISTORY_FILE} (共 {len(hist)} 筆)")
+
+# ══════════════════════════════════════════ [4] 隔日報酬回填
+def backfill_history(tx):
+    """今天的 TX OHLC = 上一筆記錄的「隔日」走勢 → 回填,讓報酬資料自動長出來"""
+    if not os.path.exists(HISTORY_FILE) or tx is None:
+        return
+    hist = pd.read_csv(HISTORY_FILE)
+    for c in NEXT_COLS + ["critical"]:
+        if c not in hist.columns:
+            hist[c] = None
+    today_str = str(date.today())
+    cand = hist[(hist["date"] < today_str) & (hist["next_close"].isna())]
+    if len(cand) == 0:
+        return
+    idx      = cand.index[-1]                       # 最近一筆未回填 = 上一個交易日
+    row_date = pd.to_datetime(hist.loc[idx, "date"]).date()
+    if (date.today() - row_date).days > 4:          # 中斷太久不硬填,避免錯置
+        print(f"[backfill] {row_date} 距今超過4天,跳過(資料不相鄰)")
+        return
+    spot_prev = float(hist.loc[idx, "spot"])
+    hist.loc[idx, "next_open"]  = tx["open"]
+    hist.loc[idx, "next_high"]  = tx["high"]
+    hist.loc[idx, "next_low"]   = tx["low"]
+    hist.loc[idx, "next_close"] = tx["close"]
+    if np.isfinite(tx["close"]) and spot_prev > 0:
+        hist.loc[idx, "next_ret_pct"] = round((tx["close"] - spot_prev) / spot_prev * 100, 3)
+    hist.to_csv(HISTORY_FILE, index=False)
+    print(f"[backfill] 已回填 {row_date} 的隔日走勢 (close {tx['close']:.0f})")
+
+# ══════════════════════════════════════════ [5] 回測引擎
+def run_backtest():
+    """按 regime 分組統計隔日表現。用法: python txo_gex.py --backtest"""
+    if not os.path.exists(HISTORY_FILE):
+        print("尚無歷史資料"); return
+    h = pd.read_csv(HISTORY_FILE)
+    h = h.dropna(subset=["next_ret_pct"]).copy()
+    if len(h) < 10:
+        print(f"有效樣本僅 {len(h)} 筆 (<10),統計不具意義,先累積資料"); return
+
+    h["next_range_pct"] = (h["next_high"] - h["next_low"]) / h["spot"] * 100
+    cost_pct = COST_PTS * 2 / h["spot"].mean() * 100   # 來回成本(%)
+
+    print(f"\n{'='*58}")
+    print(f" GEX 回測報告   樣本 {len(h)} 個交易日   來回成本 {cost_pct:.3f}%")
+    print(f"{'='*58}")
+    groups = [("全部", h),
+              ("正Gamma (POS)", h[h.regime == "POS_GAMMA"]),
+              ("負Gamma (NEG)", h[h.regime == "NEG_GAMMA"]),
+              ("臨界日",        h[h.critical == True]),
+              ("非臨界日",      h[h.critical == False])]
+    print(f"{'分組':<14}{'N':>4}{'勝率%':>8}{'均報酬%':>9}{'標準差%':>9}{'日振幅%':>9}")
+    for name, g in groups:
+        if len(g) == 0:
+            continue
+        win = (g.next_ret_pct > 0).mean() * 100
+        print(f"{name:<14}{len(g):>4}{win:>8.1f}{g.next_ret_pct.mean():>9.3f}"
+              f"{g.next_ret_pct.std():>9.3f}{g.next_range_pct.mean():>9.3f}")
+    # 核心假設檢驗:負gamma日振幅應大於正gamma
+    pos = h[h.regime == "POS_GAMMA"]["next_range_pct"]
+    neg = h[h.regime == "NEG_GAMMA"]["next_range_pct"]
+    if len(pos) >= 5 and len(neg) >= 5:
+        print(f"\n[假設檢驗] 負Gamma日均振幅 {neg.mean():.2f}% vs 正Gamma {pos.mean():.2f}%"
+              f" → {'✅ 符合模型預期' if neg.mean() > pos.mean() else '❌ 與假設相反,模型需檢討'}")
+    print(f"\n註:報酬為「訊號日結算→隔日結算」的被動持有,未含方向策略;")
+    print(f"    任何策略均需扣 {cost_pct:.3f}% 來回成本後仍為正才有意義。")
 
 # ══════════════════════════════════════════ plotting
 def plot_model(m, out="txo_gex.png", title_date=None):
@@ -463,7 +556,13 @@ def main():
     ap.add_argument("--spot", type=float, default=None)
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--push", action="store_true")
+    ap.add_argument("--backtest", action="store_true",
+                    help="輸出回測統計報告")
     args = ap.parse_args()
+
+    if args.backtest:
+        run_backtest()
+        return
 
     # ── 第二階段:只推 LINE
     if args.push:
@@ -472,6 +571,7 @@ def main():
         return
 
     # ── 第一階段:抓資料 → 模型 → 圖 + 訊號 + 記錄
+    tx = None
     if args.demo:
         df, spot = demo_data(args.spot or 44382.0)
     else:
@@ -483,15 +583,26 @@ def main():
         except Exception as e:
             print(f"[OpenAPI failed: {e}] → fallback")
             df = fetch_txo_web(date.today())
-        spot = args.spot or fetch_spot_openapi()
+        tx   = fetch_tx_daily()
+        spot = args.spot or tx["settle"]
         print(f"[spot] {spot:.0f}")
 
+    backfill_history(tx)                   # [4] 回填昨日記錄的隔日走勢
     df = apply_oi_change_weight(df)        # [3] ΔOI 權重
     m  = build_model(df, spot)
     save_oi_snapshot(df)                   # [3] 存今日快照供明日使用
 
-    regime_code, signal_text = generate_signal(m)   # [1] 訊號層
-    append_history(m, regime_code)                  # [2] 回測記錄
+    # [6] 近月 ATM IV → 自適應臨界門檻
+    atm_iv = None
+    try:
+        dd     = df.copy()
+        dd     = dd[dd["T"] == dd["T"].min()] if "T" in dd.columns else dd
+        atm_iv = float(dd.loc[(dd["strike"] - spot).abs().idxmin(), "iv"])
+    except Exception:
+        pass
+
+    regime_code, critical, signal_text = generate_signal(m, atm_iv)  # [1]+[6]
+    append_history(m, regime_code, critical)                         # [2]+[4]
 
     summary = make_summary(m, signal_text)
     print("=" * 46)
