@@ -3,7 +3,14 @@
 """
 TXO Dealer Gamma Exposure (GEX) 模型  ─ LINE 推播版 v3
 =======================================================
-v4 新增 (邁向可驗證的量化系統):
+v5 新增 (正確性與強健性):
+  [7] 全面改用「資料實際交易日」: 圖標題/history/快照/回填全部以期交所資料日為準
+  [8] 過期資料守門員: 資料日 ≤ 已記錄最後一日 → 跳過記錄/快照,LINE 提示未更新
+  [9] 時區固定 Asia/Taipei (GitHub Actions 跑在 UTC,避免日期錯位)
+  [10] 失敗 LINE 通知: 任何階段出錯立即推播原因,不再無聲死亡
+  [11] 結算日偵測: 當天有合約到期 → 摘要加註結算釘盤提醒
+
+v4 (邁向可驗證的量化系統):
   [4] 隔日報酬自動回填    → 每天抓 TX OHLC,回填昨日記錄的 next_open/high/low/close/ret
   [5] --backtest          → 回測引擎:按 regime 分組統計勝率/期望報酬/波動,含成本估算
   [6] 波動率自適應門檻    → 臨界判定改用近月 ATM IV 換算的日波動,取代固定 0.5%
@@ -25,7 +32,20 @@ import io
 import json
 import os
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+def tw_today():
+    """台北時區的今天 (Actions 跑在 UTC,不能用 date.today())"""
+    return datetime.now(ZoneInfo("Asia/Taipei")).date()
+
+def norm_date(s):
+    """期交所日期字串 → date (支援 YYYYMMDD / YYYY/MM/DD / YYYY-MM-DD)"""
+    d = str(s).strip().replace("-", "").replace("/", "")
+    try:
+        return date(int(d[:4]), int(d[4:6]), int(d[6:8]))
+    except Exception:
+        return None
 
 import matplotlib
 matplotlib.use("Agg")
@@ -146,9 +166,11 @@ def fetch_tx_daily():
         return float(v) if np.isfinite(v) and v > 0 else np.nan
     settle = num(c_settle)
     close  = num(c_last)
+    c_date = pick_col(df.columns, "日期", "date")
     return {"open": num(c_open), "high": num(c_high), "low": num(c_low),
             "close": close if np.isfinite(close) else settle,
-            "settle": settle if np.isfinite(settle) else close}
+            "settle": settle if np.isfinite(settle) else close,
+            "date": norm_date(row[c_date]) if c_date else None}
 
 def fetch_txo_web(qdate):
     url  = "https://www.taifex.com.tw/cht/3/optDailyMarketReport"
@@ -169,7 +191,7 @@ def fetch_txo_web(qdate):
     }).dropna(subset=["strike", "cp", "oi"])
 
 # ══════════════════════════════════════════ [3] OI 變化量修正
-def apply_oi_change_weight(df):
+def apply_oi_change_weight(df, data_date):
     """
     用昨日 OI 快照計算 ΔOI,調整每檔合約在 GEX 中的權重。
     邏輯(啟發式):
@@ -183,6 +205,10 @@ def apply_oi_change_weight(df):
         return df
     try:
         prev = pd.read_csv(SNAPSHOT_FILE)
+        if "data_date" in prev.columns and len(prev) and \
+           str(prev["data_date"].iloc[0]) == str(data_date):
+            print("[ΔOI] 快照與本次資料同日,權重=1 (防呆)")
+            return df
         prev["strike"] = pd.to_numeric(prev["strike"], errors="coerce")
         merged = df.merge(
             prev[["expiry_code", "strike", "cp", "oi"]],
@@ -198,14 +224,16 @@ def apply_oi_change_weight(df):
         print(f"[ΔOI] 快照讀取失敗({e}),權重=1")
     return df
 
-def save_oi_snapshot(df):
-    df[["expiry_code", "strike", "cp", "oi"]].to_csv(SNAPSHOT_FILE, index=False)
-    print(f"[ΔOI] 今日 OI 快照已存 → {SNAPSHOT_FILE}")
+def save_oi_snapshot(df, data_date):
+    out = df[["expiry_code", "strike", "cp", "oi"]].copy()
+    out["data_date"] = str(data_date)
+    out.to_csv(SNAPSHOT_FILE, index=False)
+    print(f"[ΔOI] OI 快照已存 (資料日 {data_date}) → {SNAPSHOT_FILE}")
 
 # ══════════════════════════════════════════ demo data
 def demo_data(spot=44382.0):
     rng = np.random.default_rng(7)
-    rows, today = [], date.today()
+    rows, today = [], tw_today()
     expiries = [("THISWEEK", today + timedelta(days=4)),
                 ("MONTH",    today + timedelta(days=18)),
                 ("NEXTMON",  today + timedelta(days=46))]
@@ -225,7 +253,7 @@ def demo_data(spot=44382.0):
 
 # ══════════════════════════════════════════ model core
 def build_model(df, spot, today=None):
-    today = today or date.today()
+    today = today or tw_today()
     if "_T" in df.columns:
         df["T"] = df["_T"]
     else:
@@ -302,7 +330,7 @@ def build_model(df, spot, today=None):
                 spot=float(spot))
 
 # ══════════════════════════════════════════ [1] 量化訊號層
-def generate_signal(m, atm_iv=None):
+def generate_signal(m, atm_iv=None, expiry_today=False):
     """把 GEX 結構轉成今日判讀 + 上下關卡,回傳 (regime_code, critical, text)
     [6] 臨界門檻波動率自適應: threshold = spot × ATM_IV × sqrt(1/252) × 0.5
         (= 半個「一日標準差」),無 IV 時 fallback 固定 0.5%"""
@@ -353,14 +381,16 @@ def generate_signal(m, atm_iv=None):
     if sup:
         lines.append(f"下方關卡 {sup[1]:.0f} ({sup[0]})")
     lines.append(f"💡 {bias}")
+    if expiry_today:
+        lines.append("📌 今日有合約結算,近月gamma極大,留意結算價釘盤效應")
     return regime_code, critical, "\n".join(lines)
 
 # ══════════════════════════════════════════ [2] 回測資料記錄
 NEXT_COLS = ["next_open", "next_high", "next_low", "next_close", "next_ret_pct"]
 
-def append_history(m, regime_code, critical):
+def append_history(m, regime_code, critical, data_date):
     row = {
-        "date":       str(date.today()),
+        "date":       str(data_date),
         "spot":       round(m["spot"]),
         "call_wall":  round(m["call_wall"]),
         "put_wall":   round(m["put_wall"]),
@@ -383,22 +413,22 @@ def append_history(m, regime_code, critical):
     print(f"[history] 已記錄 {row['date']} → {HISTORY_FILE} (共 {len(hist)} 筆)")
 
 # ══════════════════════════════════════════ [4] 隔日報酬回填
-def backfill_history(tx):
-    """今天的 TX OHLC = 上一筆記錄的「隔日」走勢 → 回填,讓報酬資料自動長出來"""
-    if not os.path.exists(HISTORY_FILE) or tx is None:
+def backfill_history(tx, data_date):
+    """本次抓到的 TX OHLC(屬於 data_date 交易日) = 上一筆記錄的「隔日」走勢 → 回填。
+    守門:只回填日期「早於 data_date」的記錄,杜絕 API 過期時自己填自己。"""
+    if not os.path.exists(HISTORY_FILE) or tx is None or data_date is None:
         return
     hist = pd.read_csv(HISTORY_FILE)
     for c in NEXT_COLS + ["critical"]:
         if c not in hist.columns:
             hist[c] = None
-    today_str = str(date.today())
-    cand = hist[(hist["date"] < today_str) & (hist["next_close"].isna())]
+    cand = hist[(hist["date"] < str(data_date)) & (hist["next_close"].isna())]
     if len(cand) == 0:
         return
     idx      = cand.index[-1]                       # 最近一筆未回填 = 上一個交易日
     row_date = pd.to_datetime(hist.loc[idx, "date"]).date()
-    if (date.today() - row_date).days > 4:          # 中斷太久不硬填,避免錯置
-        print(f"[backfill] {row_date} 距今超過4天,跳過(資料不相鄰)")
+    if (data_date - row_date).days > 5:             # 中斷太久不硬填,避免錯置
+        print(f"[backfill] {row_date} 與資料日 {data_date} 相距過遠,跳過")
         return
     spot_prev = float(hist.loc[idx, "spot"])
     hist.loc[idx, "next_open"]  = tx["open"]
@@ -450,7 +480,7 @@ def run_backtest():
 # ══════════════════════════════════════════ plotting
 def plot_model(m, out="txo_gex.png", title_date=None):
     p, spot    = m["profile"], m["spot"]
-    title_date = title_date or date.today().strftime("%Y/%m/%d")
+    title_date = title_date or tw_today().strftime("%Y/%m/%d")
 
     lo, hi = spot * 0.94, spot * 1.06
     p = p[(p["strike"] >= lo) & (p["strike"] <= hi)]
@@ -510,22 +540,22 @@ def get_line_token():
     r.raise_for_status()
     return r.json()["access_token"]
 
-def push_line(summary_text):
+def push_line(summary_text, with_image=True):
     uid = os.environ.get("LINE_USER_ID", "")
     if not uid or not os.environ.get("LINE_CHANNEL_ID"):
         print("[LINE] 環境變數未設定,跳過")
         return
     try:
-        token     = get_line_token()
-        image_url = f"{GITHUB_RAW}?t={int(time.time())}"
+        token = get_line_token()
         h = {"Authorization": f"Bearer {token}",
              "Content-Type": "application/json"}
-        body = {"to": uid, "messages": [
-            {"type": "text", "text": summary_text},
-            {"type": "image",
-             "originalContentUrl": image_url,
-             "previewImageUrl":    image_url}
-        ]}
+        messages = [{"type": "text", "text": summary_text}]
+        if with_image:
+            image_url = f"{GITHUB_RAW}?t={int(time.time())}"
+            messages.append({"type": "image",
+                             "originalContentUrl": image_url,
+                             "previewImageUrl":    image_url})
+        body = {"to": uid, "messages": messages}
         r = requests.post("https://api.line.me/v2/bot/message/push",
                           headers=h, json=body, timeout=15)
         r.raise_for_status()
@@ -533,11 +563,11 @@ def push_line(summary_text):
     except Exception as e:
         print(f"[LINE] push 失敗: {e}")
 
-def make_summary(m, signal_text):
+def make_summary(m, signal_text, data_date):
     mz = f"{m['macro_zero']:.0f}" if m['macro_zero'] else "N/A"
     mf = f"{m['micro_flip']:.0f}" if m['micro_flip'] else "N/A"
     return (
-        f"📊 TXO GEX  {date.today()}\n"
+        f"📊 TXO GEX  資料日 {data_date}\n"
         f"─────────────────\n"
         f"現價　　　 {m['spot']:.0f}\n"
         f"Call Wall　{m['call_wall']:.0f}\n"
@@ -567,10 +597,20 @@ def main():
     # ── 第二階段:只推 LINE
     if args.push:
         with open("summary.json") as f:
-            push_line(json.load(f)["text"])
+            d = json.load(f)
+        push_line(d["text"], with_image=d.get("image", True))
         return
 
-    # ── 第一階段:抓資料 → 模型 → 圖 + 訊號 + 記錄
+    # ── 第一階段:包例外,失敗時 LINE 通知 [10]
+    try:
+        run_pipeline(args)
+    except Exception as e:
+        msg = f"⚠️ TXO GEX 執行失敗\n{type(e).__name__}: {e}"
+        print(msg)
+        push_line(msg, with_image=False)
+        raise                              # 讓 workflow 顯示紅色失敗
+
+def run_pipeline(args):
     tx = None
     if args.demo:
         df, spot = demo_data(args.spot or 44382.0)
@@ -582,15 +622,30 @@ def main():
             print(f"[OpenAPI] TXO rows: {len(df)}")
         except Exception as e:
             print(f"[OpenAPI failed: {e}] → fallback")
-            df = fetch_txo_web(date.today())
+            df = fetch_txo_web(tw_today())
         tx   = fetch_tx_daily()
         spot = args.spot or tx["settle"]
         print(f"[spot] {spot:.0f}")
 
-    backfill_history(tx)                   # [4] 回填昨日記錄的隔日走勢
-    df = apply_oi_change_weight(df)        # [3] ΔOI 權重
+    # [7] 一切以資料實際交易日為準
+    data_date = (tx or {}).get("date") or tw_today()
+    print(f"[data_date] {data_date}")
+
+    # [8] 過期資料守門員
+    if not args.demo and os.path.exists(HISTORY_FILE):
+        hist = pd.read_csv(HISTORY_FILE)
+        if len(hist) and str(data_date) <= str(hist["date"].iloc[-1]):
+            note = (f"ℹ️ TXO GEX:期交所資料尚未更新\n"
+                    f"最新資料日仍為 {hist['date'].iloc[-1]},稍後再試")
+            print(note)
+            with open("summary.json", "w") as f:
+                json.dump({"text": note, "image": False}, f, ensure_ascii=False)
+            return
+
+    backfill_history(tx, data_date)              # [4]+[7] 回填上一筆的隔日走勢
+    df = apply_oi_change_weight(df, data_date)   # [3]+[7] ΔOI 權重
     m  = build_model(df, spot)
-    save_oi_snapshot(df)                   # [3] 存今日快照供明日使用
+    save_oi_snapshot(df, data_date)              # [3]+[7] 快照帶資料日
 
     # [6] 近月 ATM IV → 自適應臨界門檻
     atm_iv = None
@@ -601,17 +656,26 @@ def main():
     except Exception:
         pass
 
-    regime_code, critical, signal_text = generate_signal(m, atm_iv)  # [1]+[6]
-    append_history(m, regime_code, critical)                         # [2]+[4]
+    # [11] 結算日偵測:今天(台北)是否有合約到期
+    expiry_today = False
+    if not args.demo:
+        try:
+            expiries     = set(df["expiry_code"].map(parse_expiry).dropna())
+            expiry_today = tw_today() in expiries
+        except Exception:
+            pass
 
-    summary = make_summary(m, signal_text)
+    regime_code, critical, signal_text = generate_signal(m, atm_iv, expiry_today)
+    append_history(m, regime_code, critical, data_date)
+
+    summary = make_summary(m, signal_text, data_date)
     print("=" * 46)
     print(summary)
     print("=" * 46)
 
-    plot_model(m)
+    plot_model(m, title_date=data_date.strftime("%Y/%m/%d"))
     with open("summary.json", "w") as f:
-        json.dump({"text": summary}, f, ensure_ascii=False)
+        json.dump({"text": summary, "image": True}, f, ensure_ascii=False)
 
 if __name__ == "__main__":
     main()
