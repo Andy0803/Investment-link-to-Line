@@ -3,7 +3,17 @@
 """
 TXO Dealer Gamma Exposure (GEX) 模型  ─ LINE 推播版 v3
 =======================================================
-v5 新增 (正確性與強健性):
+v6 新增 (籌碼因子層):
+  [12] 三大法人期貨淨部位 (外資 TX 淨倉口數)
+  [13] 小台散戶多空比 (全市場 MTX OI 扣除法人 → 散戶情緒,反指標候選)
+  [14] TXO Put/Call Ratio (未平倉比)
+  [15] factor_history.csv → 因子滾動 z-score (60日窗,≥20樣本才啟用)
+  [16] LINE 摘要新增「📈 籌碼面」區塊 + 實驗性籌碼傾向分數
+  [17] --backtest 新增因子 IC 分析 (Spearman 相關性 vs 隔日報酬)
+  [18] safe_read_csv: 空檔/壞檔容錯,不再 EmptyDataError
+  注意:籌碼訊號為實驗性質,方向解讀需累積樣本回測驗證後才可信
+
+v5 (正確性與強健性):
   [7] 全面改用「資料實際交易日」: 圖標題/history/快照/回填全部以期交所資料日為準
   [8] 過期資料守門員: 資料日 ≤ 已記錄最後一日 → 跳過記錄/快照,LINE 提示未更新
   [9] 時區固定 Asia/Taipei (GitHub Actions 跑在 UTC,避免日期錯位)
@@ -66,9 +76,17 @@ GITHUB_RAW = (
 )
 COST_PTS      = 12.0   # 單邊交易成本估計(大台,點):手續費+期交稅+滑價,回測用
 SNAPSHOT_FILE = "oi_snapshot.csv"
+FACTOR_FILE   = "factor_history.csv"
 HISTORY_FILE  = "gex_history.csv"
 
 # ══════════════════════════════════════════ utilities
+def safe_read_csv(path):
+    """[18] 空檔案/壞檔案 → 回傳空 DataFrame,不噴錯"""
+    try:
+        return pd.read_csv(path)
+    except (pd.errors.EmptyDataError, FileNotFoundError, pd.errors.ParserError):
+        return pd.DataFrame()
+
 def pick_col(cols, *keys):
     for c in cols:
         cc = str(c).replace(" ", "").lower()
@@ -147,9 +165,15 @@ def fetch_txo_openapi():
         "oi":          pd.to_numeric(df[c_oi], errors="coerce"),
     }).dropna(subset=["strike", "cp", "oi"])
 
+_FUT_CACHE = {}
+def fetch_fut_report():
+    if "df" not in _FUT_CACHE:
+        _FUT_CACHE["df"] = fetch_openapi("DailyMarketReportFut")
+    return _FUT_CACHE["df"]
+
 def fetch_tx_daily():
     """TX 近月完整日資料 (open/high/low/close/settle) → spot + 隔日回填用"""
-    df = fetch_openapi("DailyMarketReportFut")
+    df = fetch_fut_report()
     c_contract = pick_col(df.columns, "契約", "contract")
     c_month    = pick_col(df.columns, "到期", "month")
     c_settle   = pick_col(df.columns, "結算", "settle")
@@ -204,7 +228,10 @@ def apply_oi_change_weight(df, data_date):
         print("[ΔOI] 無昨日快照,本次權重=1 (明天開始生效)")
         return df
     try:
-        prev = pd.read_csv(SNAPSHOT_FILE)
+        prev = safe_read_csv(SNAPSHOT_FILE)
+        if len(prev) == 0:
+            print("[ΔOI] 快照為空,權重=1")
+            return df
         if "data_date" in prev.columns and len(prev) and \
            str(prev["data_date"].iloc[0]) == str(data_date):
             print("[ΔOI] 快照與本次資料同日,權重=1 (防呆)")
@@ -229,6 +256,136 @@ def save_oi_snapshot(df, data_date):
     out["data_date"] = str(data_date)
     out.to_csv(SNAPSHOT_FILE, index=False)
     print(f"[ΔOI] OI 快照已存 (資料日 {data_date}) → {SNAPSHOT_FILE}")
+
+# ══════════════════════════════════════════ [12-15] 籌碼因子層
+def try_openapi(paths):
+    """依序嘗試多個候選端點 (期交所端點名稱可能調整,防禦性設計)"""
+    for p in paths:
+        try:
+            df = fetch_openapi(p)
+            if len(df):
+                return df
+        except Exception:
+            continue
+    return None
+
+def fetch_chip_factors():
+    """抓三大法人/散戶/PCR 籌碼因子。任何一項失敗回 None,不影響主流程。"""
+    out = {"foreign_net": None, "retail_ratio": None, "pcr_oi": None}
+
+    # [12] 三大法人期貨 (取外資 TX 淨未平倉口數)
+    inst = try_openapi([
+        "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsBytheDate",
+        "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsByDate",
+        "MajorInstitutionalTradersFut",
+    ])
+    inst_mtx_long = inst_mtx_short = None
+    if inst is not None:
+        try:
+            c_prod = pick_col(inst.columns, "商品", "契約", "contract", "product")
+            c_id   = pick_col(inst.columns, "身份", "身分", "identity", "trader")
+            c_ln   = pick_col(inst.columns, "多方未平倉口數", "多方未平倉")
+            c_sn   = pick_col(inst.columns, "空方未平倉口數", "空方未平倉")
+            d = inst.copy()
+            d["_p"]  = d[c_prod].astype(str)
+            d["_id"] = d[c_id].astype(str)
+            d["_l"]  = pd.to_numeric(d[c_ln].astype(str).str.replace(",", ""), errors="coerce")
+            d["_s"]  = pd.to_numeric(d[c_sn].astype(str).str.replace(",", ""), errors="coerce")
+            tx = d[d["_p"].str.contains("臺股期貨|台股期貨|TX(?!F)", regex=True, na=False)]
+            fr = tx[tx["_id"].str.contains("外資", na=False)]
+            if len(fr):
+                out["foreign_net"] = float(fr["_l"].sum() - fr["_s"].sum())
+            mtx = d[d["_p"].str.contains("小型臺指|小型台指|MTX", na=False)]
+            if len(mtx):
+                inst_mtx_long  = float(mtx["_l"].sum())
+                inst_mtx_short = float(mtx["_s"].sum())
+        except Exception as e:
+            print(f"[chip] 法人資料解析失敗: {e}")
+
+    # [13] 小台散戶多空比 = (散戶多單-散戶空單)/全市場OI
+    try:
+        fut = fetch_fut_report()
+        c_contract = pick_col(fut.columns, "契約", "contract")
+        c_oi       = pick_col(fut.columns, "未沖銷", "openinterest", "oi")
+        c_month    = pick_col(fut.columns, "到期", "month")
+        mtx = fut[fut[c_contract].astype(str).str.strip() == "MTX"].copy()
+        mtx = mtx[mtx[c_month].astype(str).str.strip().str.fullmatch(r"\d{6}")]
+        total_oi = pd.to_numeric(mtx[c_oi], errors="coerce").sum()
+        if total_oi > 0 and inst_mtx_long is not None:
+            r_long  = total_oi - inst_mtx_long
+            r_short = total_oi - inst_mtx_short
+            out["retail_ratio"] = round(float((r_long - r_short) / total_oi), 4)
+    except Exception as e:
+        print(f"[chip] 小台散戶比計算失敗: {e}")
+
+    # [14] TXO Put/Call Ratio (未平倉比)
+    pcr = try_openapi(["PutCallRatio", "PutCallRatioByDate"])
+    if pcr is not None:
+        try:
+            c = pick_col(pcr.columns, "未平倉量比率", "oiratio", "putcalloiratio")
+            v = pd.to_numeric(str(pcr.iloc[-1][c]).replace("%", ""), errors="coerce")
+            if np.isfinite(v):
+                out["pcr_oi"] = float(v / 100 if v > 10 else v)
+        except Exception as e:
+            print(f"[chip] PCR 解析失敗: {e}")
+
+    got = [k for k, v in out.items() if v is not None]
+    print(f"[chip] 取得因子: {got if got else '無 (端點全數失敗,僅跑GEX)'}")
+    return out
+
+def update_factor_history(data_date, factors):
+    """[15] 因子存檔 (同日覆蓋) → 回傳完整歷史供 z-score 計算"""
+    fh = safe_read_csv(FACTOR_FILE)
+    row = {"date": str(data_date), **factors}
+    if len(fh):
+        fh = fh[fh["date"] != row["date"]]
+        fh = pd.concat([fh, pd.DataFrame([row])], ignore_index=True).sort_values("date")
+    else:
+        fh = pd.DataFrame([row])
+    fh.to_csv(FACTOR_FILE, index=False)
+    return fh
+
+def factor_z(fh, col, window=60, min_n=20):
+    """滾動 z-score。樣本 < min_n 回 None (避免早期亂訊號)"""
+    if col not in fh.columns:
+        return None
+    s = pd.to_numeric(fh[col], errors="coerce").dropna()
+    if len(s) < min_n:
+        return None
+    w = s.tail(window)
+    sd = w.std()
+    if not np.isfinite(sd) or sd == 0:
+        return None
+    return float((s.iloc[-1] - w.mean()) / sd)
+
+def chip_signal_block(fh, factors):
+    """[16] 組 LINE 摘要的籌碼面區塊。z 可用時給傾向,否則只列原始值。"""
+    lines, tilt_parts = ["📈 籌碼面"], []
+    def arrow(z):
+        return "↑偏多" if z > 0.5 else ("↓偏空" if z < -0.5 else "→中性")
+
+    if factors.get("foreign_net") is not None:
+        z = factor_z(fh, "foreign_net")
+        if z is not None:
+            lines.append(f"外資期貨淨倉 {factors['foreign_net']:+,.0f}口 ({z:+.1f}σ {arrow(z)})")
+            tilt_parts.append(z)                      # 外資偏多 → 偏多
+        else:
+            lines.append(f"外資期貨淨倉 {factors['foreign_net']:+,.0f}口 (z累積中)")
+    if factors.get("retail_ratio") is not None:
+        z = factor_z(fh, "retail_ratio")
+        if z is not None:
+            lines.append(f"小台散戶多空比 {factors['retail_ratio']:+.1%} ({z:+.1f}σ)")
+            tilt_parts.append(-z)                     # 散戶極多 → 反指標偏空
+        else:
+            lines.append(f"小台散戶多空比 {factors['retail_ratio']:+.1%} (z累積中)")
+    if factors.get("pcr_oi") is not None:
+        lines.append(f"P/C Ratio(OI) {factors['pcr_oi']:.2f}")
+
+    if tilt_parts:
+        t = float(np.mean(tilt_parts))
+        d = "偏多" if t > 0.3 else ("偏空" if t < -0.3 else "中性")
+        lines.append(f"籌碼傾向(實驗): {d} ({t:+.1f})")
+    return "\n".join(lines) if len(lines) > 1 else None
 
 # ══════════════════════════════════════════ demo data
 def demo_data(spot=44382.0):
@@ -388,7 +545,7 @@ def generate_signal(m, atm_iv=None, expiry_today=False):
 # ══════════════════════════════════════════ [2] 回測資料記錄
 NEXT_COLS = ["next_open", "next_high", "next_low", "next_close", "next_ret_pct"]
 
-def append_history(m, regime_code, critical, data_date):
+def append_history(m, regime_code, critical, data_date, factors=None):
     row = {
         "date":       str(data_date),
         "spot":       round(m["spot"]),
@@ -401,10 +558,12 @@ def append_history(m, regime_code, critical, data_date):
         "regime":     regime_code,
         "critical":   bool(critical),
     }
+    for k, v in (factors or {}).items():
+        row[k] = v
     for c in NEXT_COLS:
         row[c] = None
-    if os.path.exists(HISTORY_FILE):
-        hist = pd.read_csv(HISTORY_FILE)
+    hist = safe_read_csv(HISTORY_FILE)
+    if len(hist):
         hist = hist[hist["date"] != row["date"]]          # 同日重跑 → 覆蓋
         hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
     else:
@@ -418,7 +577,9 @@ def backfill_history(tx, data_date):
     守門:只回填日期「早於 data_date」的記錄,杜絕 API 過期時自己填自己。"""
     if not os.path.exists(HISTORY_FILE) or tx is None or data_date is None:
         return
-    hist = pd.read_csv(HISTORY_FILE)
+    hist = safe_read_csv(HISTORY_FILE)
+    if len(hist) == 0:
+        return
     for c in NEXT_COLS + ["critical"]:
         if c not in hist.columns:
             hist[c] = None
@@ -443,9 +604,9 @@ def backfill_history(tx, data_date):
 # ══════════════════════════════════════════ [5] 回測引擎
 def run_backtest():
     """按 regime 分組統計隔日表現。用法: python txo_gex.py --backtest"""
-    if not os.path.exists(HISTORY_FILE):
+    h = safe_read_csv(HISTORY_FILE)
+    if len(h) == 0:
         print("尚無歷史資料"); return
-    h = pd.read_csv(HISTORY_FILE)
     h = h.dropna(subset=["next_ret_pct"]).copy()
     if len(h) < 10:
         print(f"有效樣本僅 {len(h)} 筆 (<10),統計不具意義,先累積資料"); return
@@ -474,6 +635,20 @@ def run_backtest():
     if len(pos) >= 5 and len(neg) >= 5:
         print(f"\n[假設檢驗] 負Gamma日均振幅 {neg.mean():.2f}% vs 正Gamma {pos.mean():.2f}%"
               f" → {'✅ 符合模型預期' if neg.mean() > pos.mean() else '❌ 與假設相反,模型需檢討'}")
+    # [17] 因子 IC:Spearman 相關 (因子值 vs 隔日報酬)
+    from scipy.stats import spearmanr
+    fac_cols = [c for c in ("foreign_net", "retail_ratio", "pcr_oi") if c in h.columns]
+    rows = []
+    for c in fac_cols:
+        sub = h.dropna(subset=[c, "next_ret_pct"])
+        if len(sub) >= 15:
+            ic, p = spearmanr(sub[c], sub["next_ret_pct"])
+            rows.append((c, len(sub), ic, p))
+    if rows:
+        print(f"\n[因子IC] Spearman(因子, 隔日報酬)  |IC|>0.1且p<0.1才值得關注")
+        for c, n, ic, p in rows:
+            print(f"  {c:<14} N={n:<4} IC={ic:+.3f}  p={p:.3f}")
+
     print(f"\n註:報酬為「訊號日結算→隔日結算」的被動持有,未含方向策略;")
     print(f"    任何策略均需扣 {cost_pct:.3f}% 來回成本後仍為正才有意義。")
 
@@ -632,9 +807,10 @@ def run_pipeline(args):
     print(f"[data_date] {data_date}")
 
     # [8] 過期資料守門員
-    if not args.demo and os.path.exists(HISTORY_FILE):
-        hist = pd.read_csv(HISTORY_FILE)
-        if len(hist) and str(data_date) <= str(hist["date"].iloc[-1]):
+    if not args.demo:
+        hist = safe_read_csv(HISTORY_FILE)
+        if len(hist) and "date" in hist.columns and \
+           str(data_date) <= str(hist["date"].iloc[-1]):
             note = (f"ℹ️ TXO GEX:期交所資料尚未更新\n"
                     f"最新資料日仍為 {hist['date'].iloc[-1]},稍後再試")
             print(note)
@@ -665,8 +841,21 @@ def run_pipeline(args):
         except Exception:
             pass
 
+    # [12-16] 籌碼因子 (任何失敗不影響 GEX 主流程)
+    factors, chip_block = {}, None
+    if not args.demo:
+        try:
+            factors    = fetch_chip_factors()
+            fh         = update_factor_history(data_date, factors)
+            chip_block = chip_signal_block(fh, factors)
+        except Exception as e:
+            print(f"[chip] 籌碼模組失敗(不影響GEX): {e}")
+
     regime_code, critical, signal_text = generate_signal(m, atm_iv, expiry_today)
-    append_history(m, regime_code, critical, data_date)
+    if chip_block:
+        signal_text = signal_text + "\n─────────────────\n" + chip_block
+    append_history(m, regime_code, critical, data_date,
+                   {k: v for k, v in factors.items() if v is not None})
 
     summary = make_summary(m, signal_text, data_date)
     print("=" * 46)
