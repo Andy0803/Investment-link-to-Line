@@ -251,6 +251,11 @@ def build_model(df, spot, today=None):
 def plot_model(m, out="txo_gex.png", title_date=None):
     p, spot    = m["profile"], m["spot"]
     title_date = title_date or date.today().strftime("%Y/%m/%d")
+
+    # 只顯示 spot ±6% 範圍,深度 OTM 不畫(GEX 趨近 0,只會壓縮版面)
+    lo, hi = spot * 0.94, spot * 1.06
+    p = p[(p["strike"] >= lo) & (p["strike"] <= hi)]
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12,10))
 
     ax1.axvspan(spot*0.98, spot*1.02, color="yellow", alpha=0.18, label="ATM Zone (±2%)")
@@ -258,14 +263,26 @@ def plot_model(m, out="txo_gex.png", title_date=None):
     ax1.bar(p["strike"], p["call"], width=w, color="mediumseagreen", alpha=0.65, label="Call $GEX")
     ax1.bar(p["strike"], p["put"],  width=w, color="salmon",         alpha=0.75, label="Put $GEX")
     ax1.plot(p["strike"], p["net"], color="gray", lw=1.4, label="Net $GEX")
-    ax1.axvline(m["call_wall"], color="green",  lw=2.4,      label=f"Call Wall: {m['call_wall']:.0f}")
-    ax1.axvline(m["put_wall"],  color="red",    lw=2.4,      label=f"Put Wall: {m['put_wall']:.0f}")
+    if lo < m["call_wall"] < hi:
+        ax1.axvline(m["call_wall"], color="green", lw=2.4,    label=f"Call Wall: {m['call_wall']:.0f}")
+    if lo < m["put_wall"] < hi:
+        ax1.axvline(m["put_wall"],  color="red",   lw=2.4,    label=f"Put Wall: {m['put_wall']:.0f}")
     if m["micro_flip"]:
         ax1.axvline(m["micro_flip"], color="orange", lw=2,   label=f"Micro Flip: {m['micro_flip']:.0f}")
     if m["macro_zero"]:
         ax1.axvline(m["macro_zero"], color="purple", ls="-.",lw=1.8,
                     label=f"Macro Zero: {m['macro_zero']:.0f}")
     ax1.axvline(spot, color="navy", ls="--", lw=1.8, label=f"Previous Price: {spot:.0f}")
+    ax1.set_xlim(lo, hi)
+    # 牆若在顯示範圍外,用文字標註
+    notes = []
+    if not (lo < m["call_wall"] < hi):
+        notes.append(f"Call Wall: {m['call_wall']:.0f} (out of view →)")
+    if not (lo < m["put_wall"] < hi):
+        notes.append(f"← Put Wall: {m['put_wall']:.0f} (out of view)")
+    if notes:
+        ax1.text(0.99, 0.02, "   ".join(notes), transform=ax1.transAxes,
+                 ha="right", va="bottom", fontsize=9, color="dimgray")
     ax1.set_title(f"TXO Net Exposure & Pre-Market Key Levels ({title_date})", fontsize=14)
     ax1.legend(loc="upper left", fontsize=8, ncol=2)
     ax1.grid(alpha=0.25)
@@ -275,6 +292,7 @@ def plot_model(m, out="txo_gex.png", title_date=None):
     ax2.axvline(m["peak"],   color="green", ls=":", lw=2, label=f"Peak: {m['peak']:.0f}")
     ax2.axvline(m["valley"], color="red",   ls=":", lw=2, label=f"Valley: {m['valley']:.0f}")
     ax2.axvline(spot, color="navy", ls="--", lw=1.8)
+    ax2.set_xlim(lo, hi)
     ax2.legend(loc="upper left", fontsize=9)
     ax2.grid(alpha=0.25)
 
