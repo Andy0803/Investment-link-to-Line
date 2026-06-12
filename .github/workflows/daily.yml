@@ -2,8 +2,11 @@ name: TXO GEX Daily
 
 on:
   schedule:
-    - cron: '0 0 * * 1-5'   # UTC 00:00 = 台北時間 08:00，週一到週五
-  workflow_dispatch:          # 手動觸發（測試用）
+    - cron: '0 0 * * 1-5'   # UTC 00:00 = 台北 08:00，週一到週五
+  workflow_dispatch:
+
+permissions:
+  contents: write            # 允許 Actions commit PNG 回 repo
 
 jobs:
   run:
@@ -21,12 +24,31 @@ jobs:
       - name: Install dependencies
         run: pip install requests pandas scipy matplotlib lxml html5lib
 
-      - name: Run GEX model & push LINE
+      # 第一階段：產生 PNG + summary.json
+      - name: Generate GEX chart
+        env:
+          LINE_CHANNEL_ID:     ${{ secrets.LINE_CHANNEL_ID }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+        run: python txo_gex.py
+
+      # 第二階段：把 PNG commit 回 repo（讓 GitHub raw URL 有最新圖）
+      - name: Commit chart to repo
+        run: |
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add txo_gex.png
+          git diff --staged --quiet || git commit -m "GEX update $(date +'%Y-%m-%d')"
+          git push
+
+      # 等 GitHub CDN 更新後推 LINE
+      - name: Wait for CDN
+        run: sleep 10
+
+      # 第三階段：推 LINE 訊息
+      - name: Push LINE message
         env:
           LINE_CHANNEL_ID:     ${{ secrets.LINE_CHANNEL_ID }}
           LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
           LINE_USER_ID:        ${{ secrets.LINE_USER_ID }}
-          IMGBB_KEY:           ${{ secrets.IMGBB_KEY }}
-        run: python txo_gex.py
-
+        run: python txo_gex.py --push
 
