@@ -1,0 +1,32 @@
+name: TXO GEX Daily
+
+on:
+  schedule:
+    - cron: '0 0 * * 1-5'   # UTC 00:00 = 台北時間 08:00，週一到週五
+  workflow_dispatch:          # 手動觸發（測試用）
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pandas scipy matplotlib lxml html5lib
+
+      - name: Run GEX model & push LINE
+        env:
+          LINE_CHANNEL_ID:     ${{ secrets.LINE_CHANNEL_ID }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+          LINE_USER_ID:        ${{ secrets.LINE_USER_ID }}
+          IMGBB_KEY:           ${{ secrets.IMGBB_KEY }}
+        run: python txo_gex.py
+
+
