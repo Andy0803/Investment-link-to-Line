@@ -279,35 +279,37 @@ def fetch_chip_factors():
         "MarketDataOfMajorInstitutionalTradersDetailsOfFuturesContractsByDate",
         "MajorInstitutionalTradersFut",
     ])
-    inst_mtx_long = inst_mtx_short = None
+    inst_mtx_net = None
     if inst is not None:
         try:
             print(f"[chip] 法人端點欄位: {list(inst.columns)}")
-            c_prod = pick_col(inst.columns, "商品名稱", "商品", "契約", "contract", "product")
-            c_id   = pick_col(inst.columns, "身份別", "身分別", "身份", "身分", "identity", "trader")
-            c_ln   = pick_col(inst.columns, "多方未平倉口數", "多方未平倉契約金額", "多方未平倉", "longoi", "openinterestlong")
-            c_sn   = pick_col(inst.columns, "空方未平倉口數", "空方未平倉契約金額", "空方未平倉", "shortoi", "openinterestshort")
-            missing = [n for n,c in [("商品",c_prod),("身份",c_id),("多方OI",c_ln),("空方OI",c_sn)] if c is None]
+            c_code = pick_col(inst.columns, "ContractCode", "商品代號", "契約", "商品")
+            c_item = pick_col(inst.columns, "Item", "身份別", "身份")
+            c_net  = pick_col(inst.columns, "OpenInterest(Net)", "未平倉淨額", "淨未平倉")
+            c_long = pick_col(inst.columns, "OpenInterest(Long)", "多方未平倉")
+            c_short= pick_col(inst.columns, "OpenInterest(Short)", "空方未平倉")
+            missing = [n for n,c in [("商品",c_code),("淨OI",c_net)] if c is None]
             if missing:
-                print(f"[chip] 法人欄位對不上,缺: {missing} (請把上面欄位列貼給開發者)")
+                print(f"[chip] 法人欄位對不上,缺: {missing}")
             else:
                 d = inst.copy()
-                d["_p"]  = d[c_prod].astype(str)
-                d["_id"] = d[c_id].astype(str)
-                d["_l"]  = pd.to_numeric(d[c_ln].astype(str).str.replace(",", ""), errors="coerce")
-                d["_s"]  = pd.to_numeric(d[c_sn].astype(str).str.replace(",", ""), errors="coerce")
-                tx = d[d["_p"].str.contains("臺股期貨|台股期貨", regex=True, na=False)]
-                fr = tx[tx["_id"].str.contains("外資", na=False)]
-                if len(fr):
-                    out["foreign_net"] = float(fr["_l"].sum() - fr["_s"].sum())
-                mtx = d[d["_p"].str.contains("小型臺指|小型台指", na=False)]
-                if len(mtx):
-                    inst_mtx_long  = float(mtx["_l"].sum())
-                    inst_mtx_short = float(mtx["_s"].sum())
+                d["_code"] = d[c_code].astype(str).str.strip().str.upper()
+                def num(col):
+                    return pd.to_numeric(d[col].astype(str).str.replace(",",""), errors="coerce")
+                # 有淨額欄直接用,否則 多-空
+                d["_net"] = num(c_net) if c_net else (num(c_long) - num(c_short))
+                # 此端點為三大法人「合計」(無身份別),抓 TXF=臺股期貨, MXF=小型臺指
+                tx_rows  = d[d["_code"].str.contains("TXF|TX$|臺股期貨", regex=True, na=False)]
+                mtx_rows = d[d["_code"].str.contains("MXF|MTX|小型臺指", regex=True, na=False)]
+                if len(tx_rows):
+                    out["foreign_net"] = float(tx_rows["_net"].sum())   # 沿用欄名,實為三大法人合計淨倉
+                    print(f"[chip] 三大法人 TXF 淨未平倉: {out['foreign_net']:+.0f} 口")
+                if len(mtx_rows):
+                    inst_mtx_net = float(mtx_rows["_net"].sum())
         except Exception as e:
             print(f"[chip] 法人資料解析失敗: {type(e).__name__}: {e}")
 
-    # [13] 小台散戶多空比 = (散戶多單-散戶空單)/全市場OI
+    # [13] 小台散戶多空比:散戶淨倉 ≈ -法人淨倉 (零和),除以全市場OI標準化
     try:
         fut = fetch_fut_report()
         c_contract = pick_col(fut.columns, "契約", "contract")
@@ -316,10 +318,9 @@ def fetch_chip_factors():
         mtx = fut[fut[c_contract].astype(str).str.strip() == "MTX"].copy()
         mtx = mtx[mtx[c_month].astype(str).str.strip().str.fullmatch(r"\d{6}")]
         total_oi = pd.to_numeric(mtx[c_oi], errors="coerce").sum()
-        if total_oi > 0 and inst_mtx_long is not None:
-            r_long  = total_oi - inst_mtx_long
-            r_short = total_oi - inst_mtx_short
-            out["retail_ratio"] = round(float((r_long - r_short) / total_oi), 4)
+        if total_oi > 0 and inst_mtx_net is not None:
+            # 散戶淨 = 全體零和 → 法人淨倉的反向;比值正=散戶偏多
+            out["retail_ratio"] = round(float(-inst_mtx_net / total_oi), 4)
     except Exception as e:
         print(f"[chip] 小台散戶比計算失敗: {e}")
 
@@ -372,10 +373,10 @@ def chip_signal_block(fh, factors):
     if factors.get("foreign_net") is not None:
         z = factor_z(fh, "foreign_net")
         if z is not None:
-            lines.append(f"外資期貨淨倉 {factors['foreign_net']:+,.0f}口 ({z:+.1f}σ {arrow(z)})")
+            lines.append(f"三大法人淨倉 {factors['foreign_net']:+,.0f}口 ({z:+.1f}σ {arrow(z)})")
             tilt_parts.append(z)                      # 外資偏多 → 偏多
         else:
-            lines.append(f"外資期貨淨倉 {factors['foreign_net']:+,.0f}口 (z累積中)")
+            lines.append(f"三大法人淨倉 {factors['foreign_net']:+,.0f}口 (z累積中)")
     if factors.get("retail_ratio") is not None:
         z = factor_z(fh, "retail_ratio")
         if z is not None:
@@ -570,9 +571,12 @@ def append_history(m, regime_code, critical, data_date, factors=None):
     hist = safe_read_csv(HISTORY_FILE)
     if len(hist):
         hist = hist[hist["date"] != row["date"]]          # 同日重跑 → 覆蓋
-        new_row = pd.DataFrame([row])
-        # 避免 all-NA 欄觸發 FutureWarning:對齊欄位後再接
-        hist = pd.concat([hist, new_row], ignore_index=True) if len(hist) else new_row
+        new_row = pd.DataFrame([row]).reindex(columns=hist.columns.union(pd.Index(row.keys()), sort=False))
+        hist = hist.reindex(columns=new_row.columns)
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            hist = pd.concat([hist, new_row], ignore_index=True)
     else:
         hist = pd.DataFrame([row])
     hist.to_csv(HISTORY_FILE, index=False)
