@@ -282,25 +282,30 @@ def fetch_chip_factors():
     inst_mtx_long = inst_mtx_short = None
     if inst is not None:
         try:
-            c_prod = pick_col(inst.columns, "商品", "契約", "contract", "product")
-            c_id   = pick_col(inst.columns, "身份", "身分", "identity", "trader")
-            c_ln   = pick_col(inst.columns, "多方未平倉口數", "多方未平倉")
-            c_sn   = pick_col(inst.columns, "空方未平倉口數", "空方未平倉")
-            d = inst.copy()
-            d["_p"]  = d[c_prod].astype(str)
-            d["_id"] = d[c_id].astype(str)
-            d["_l"]  = pd.to_numeric(d[c_ln].astype(str).str.replace(",", ""), errors="coerce")
-            d["_s"]  = pd.to_numeric(d[c_sn].astype(str).str.replace(",", ""), errors="coerce")
-            tx = d[d["_p"].str.contains("臺股期貨|台股期貨|TX(?!F)", regex=True, na=False)]
-            fr = tx[tx["_id"].str.contains("外資", na=False)]
-            if len(fr):
-                out["foreign_net"] = float(fr["_l"].sum() - fr["_s"].sum())
-            mtx = d[d["_p"].str.contains("小型臺指|小型台指|MTX", na=False)]
-            if len(mtx):
-                inst_mtx_long  = float(mtx["_l"].sum())
-                inst_mtx_short = float(mtx["_s"].sum())
+            print(f"[chip] 法人端點欄位: {list(inst.columns)}")
+            c_prod = pick_col(inst.columns, "商品名稱", "商品", "契約", "contract", "product")
+            c_id   = pick_col(inst.columns, "身份別", "身分別", "身份", "身分", "identity", "trader")
+            c_ln   = pick_col(inst.columns, "多方未平倉口數", "多方未平倉契約金額", "多方未平倉", "longoi", "openinterestlong")
+            c_sn   = pick_col(inst.columns, "空方未平倉口數", "空方未平倉契約金額", "空方未平倉", "shortoi", "openinterestshort")
+            missing = [n for n,c in [("商品",c_prod),("身份",c_id),("多方OI",c_ln),("空方OI",c_sn)] if c is None]
+            if missing:
+                print(f"[chip] 法人欄位對不上,缺: {missing} (請把上面欄位列貼給開發者)")
+            else:
+                d = inst.copy()
+                d["_p"]  = d[c_prod].astype(str)
+                d["_id"] = d[c_id].astype(str)
+                d["_l"]  = pd.to_numeric(d[c_ln].astype(str).str.replace(",", ""), errors="coerce")
+                d["_s"]  = pd.to_numeric(d[c_sn].astype(str).str.replace(",", ""), errors="coerce")
+                tx = d[d["_p"].str.contains("臺股期貨|台股期貨", regex=True, na=False)]
+                fr = tx[tx["_id"].str.contains("外資", na=False)]
+                if len(fr):
+                    out["foreign_net"] = float(fr["_l"].sum() - fr["_s"].sum())
+                mtx = d[d["_p"].str.contains("小型臺指|小型台指", na=False)]
+                if len(mtx):
+                    inst_mtx_long  = float(mtx["_l"].sum())
+                    inst_mtx_short = float(mtx["_s"].sum())
         except Exception as e:
-            print(f"[chip] 法人資料解析失敗: {e}")
+            print(f"[chip] 法人資料解析失敗: {type(e).__name__}: {e}")
 
     # [13] 小台散戶多空比 = (散戶多單-散戶空單)/全市場OI
     try:
@@ -565,7 +570,9 @@ def append_history(m, regime_code, critical, data_date, factors=None):
     hist = safe_read_csv(HISTORY_FILE)
     if len(hist):
         hist = hist[hist["date"] != row["date"]]          # 同日重跑 → 覆蓋
-        hist = pd.concat([hist, pd.DataFrame([row])], ignore_index=True)
+        new_row = pd.DataFrame([row])
+        # 避免 all-NA 欄觸發 FutureWarning:對齊欄位後再接
+        hist = pd.concat([hist, new_row], ignore_index=True) if len(hist) else new_row
     else:
         hist = pd.DataFrame([row])
     hist.to_csv(HISTORY_FILE, index=False)
